@@ -1,0 +1,1147 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>포트리스 : 2인 대전</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060d;overflow:hidden;
+    font-family:"Malgun Gothic","맑은 고딕",monospace;color:#cfd6ff}
+  #wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+  canvas{image-rendering:pixelated;image-rendering:crisp-edges;
+    box-shadow:0 0 0 2px #1b2040,0 0 40px #0a0f2a}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="640" height="360"></canvas></div>
+<script>
+"use strict";
+
+/* ============================================================
+   포트리스 스타일 2인 대전  —  단일 파일
+   좌표계: 내부 해상도 640x360 픽셀, 정수배 확대
+   ============================================================ */
+
+const W = 640, H = 360;
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+function fit(){
+  const s = Math.max(1, Math.min(Math.floor(innerWidth/W), Math.floor(innerHeight/H)));
+  cv.style.width = (W*s)+'px'; cv.style.height = (H*s)+'px';
+}
+addEventListener('resize', fit); fit();
+
+const rnd = (a,b)=>a+Math.random()*(b-a);
+const clamp = (v,a,b)=>v<a?a:v>b?b:v;
+
+/* ---------------- 무기 ---------------- */
+/* dmg = 직격 데미지. 거리가 멀어질수록 급격히 감소한다. */
+const WEAPONS = [
+  {id:'normal', name:'노말탄',   ammo:Infinity, r:20, dmg:30, color:'#ffe08a', tip:'무한 탄약. 기본기.'},
+  {id:'wide',   name:'광역탄',   ammo:3,  r:46, dmg:46, color:'#ff9a5c', tip:'폭발 반경이 크다. 지형을 크게 판다.'},
+  {id:'dig',    name:'땅굴탄',   ammo:3,  r:42, dmg:46, color:'#c08a4a', tip:'땅에 박히면 파고 들어가 안에서 크게 터진다.'},
+  {id:'inter',  name:'요격기',   ammo:2,  r:12, dmg:8,  color:'#6cf0c8', tip:'떨어진 자리에 요격기 설치. 적 포탄 1발을 공중에서 격추.'},
+  {id:'rad',    name:'방사능탄', ammo:2,  r:28, dmg:22, color:'#a8ff5c', tip:'오염 지대 생성. 그 안에 서 있으면 턴마다 피해.'},
+  {id:'mirv',   name:'다연장',   ammo:2,  r:18, dmg:20, color:'#ff7ad0', tip:'정점에서 3발로 분열한다.'},
+];
+
+/* ---------------- 맵 ---------------- */
+const MAPS = [
+  {id:'hill',    name:'언덕',   tip:'완만한 능선. 무난한 기본 지형'},
+  {id:'canyon',  name:'협곡',   tip:'가운데가 깊게 갈라졌다. 넘겨 쏴야 한다'},
+  {id:'plateau', name:'고원',   tip:'절벽 위 대지. 발밑이 무너지면 크게 떨어진다'},
+  {id:'island',  name:'쌍섬',   tip:'가운데가 뻥 뚫림. 밀려나면 그대로 추락사'},
+  {id:'plain',   name:'평원',   tip:'거의 평지. 엄폐물 없는 순수 조준 싸움'},
+  {id:'peak',    name:'첨봉',   tip:'뾰족한 봉우리. 각도 싸움'},
+  {id:'random',  name:'랜덤',   tip:'매판 무작위 지형'},
+];
+const MODES = [
+  {name:'1인용', sub:'vs COM'},
+  {name:'2인용', sub:'1P vs 2P'},
+];
+let mode = 1, mapSel = 0, menuRow = 0, curMap = 'hill';
+
+/* 오를 수 있는 최대 단차(px). 이보다 큰 턱은 못 올라간다 */
+const CLIMB = 9;
+
+/* ---------------- 사운드 (WebAudio) ---------------- */
+let AC = null;
+function ac(){
+  if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+  if(AC && AC.state === 'suspended') AC.resume();
+  return AC;
+}
+function tone(freq, dur, type='square', vol=0.12, slide=0){
+  const a = ac(); if(!a) return;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, a.currentTime);
+  if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,freq+slide), a.currentTime+dur);
+  g.gain.setValueAtTime(vol, a.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0008, a.currentTime+dur);
+  o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime+dur+0.02);
+}
+function noiseBuf(){
+  const a = ac(); if(!a) return null;
+  if(noiseBuf._b) return noiseBuf._b;
+  const b = a.createBuffer(1, a.sampleRate*1.2, a.sampleRate);
+  const d = b.getChannelData(0);
+  for(let i=0;i<d.length;i++) d[i] = Math.random()*2-1;
+  return noiseBuf._b = b;
+}
+function boom(size=1){
+  const a = ac(); if(!a) return;
+  const s = a.createBufferSource(); s.buffer = noiseBuf();
+  const f = a.createBiquadFilter(); f.type='lowpass';
+  f.frequency.setValueAtTime(2200*size, a.currentTime);
+  f.frequency.exponentialRampToValueAtTime(90, a.currentTime+0.5*size);
+  const g = a.createGain();
+  g.gain.setValueAtTime(0.45, a.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, a.currentTime+0.55*size);
+  s.connect(f); f.connect(g); g.connect(a.destination); s.start(); s.stop(a.currentTime+0.6*size);
+  const o = a.createOscillator(), og = a.createGain();
+  o.type='sine'; o.frequency.setValueAtTime(120, a.currentTime);
+  o.frequency.exponentialRampToValueAtTime(35, a.currentTime+0.4);
+  og.gain.setValueAtTime(0.4, a.currentTime);
+  og.gain.exponentialRampToValueAtTime(0.001, a.currentTime+0.45);
+  o.connect(og); og.connect(a.destination); o.start(); o.stop(a.currentTime+0.5);
+}
+/* 비행중 "퓨유유융" 휘파람 */
+let whistle = null;
+function whistleStart(){
+  const a = ac(); if(!a || whistle) return;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type='sine'; o.frequency.setValueAtTime(760, a.currentTime);
+  g.gain.setValueAtTime(0.0001, a.currentTime);
+  g.gain.linearRampToValueAtTime(0.09, a.currentTime+0.05);
+  o.connect(g); g.connect(a.destination); o.start();
+  whistle = {o,g};
+}
+function whistleSet(vy){
+  if(!whistle) return; const a = ac();
+  const f = clamp(300 - vy*55, 110, 900);
+  whistle.o.frequency.setTargetAtTime(f, a.currentTime, 0.05);
+}
+function whistleStop(){
+  if(!whistle) return; const a = ac();
+  whistle.g.gain.setTargetAtTime(0.0001, a.currentTime, 0.03);
+  const w = whistle; setTimeout(()=>{ try{w.o.stop();}catch(e){} }, 200);
+  whistle = null;
+}
+let charge = null;
+function chargeStart(){
+  const a = ac(); if(!a || charge) return;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type='triangle'; o.frequency.setValueAtTime(120, a.currentTime);
+  g.gain.setValueAtTime(0.05, a.currentTime);
+  o.connect(g); g.connect(a.destination); o.start();
+  charge = {o,g};
+}
+function chargeSet(p){
+  if(!charge) return; const a = ac();
+  charge.o.frequency.setTargetAtTime(120 + p*6, a.currentTime, 0.02);
+}
+function chargeStop(){
+  if(!charge) return; try{ charge.o.stop(); }catch(e){}
+  charge = null;
+}
+
+/* ---------------- 지형 (픽셀 단위 파괴) ---------------- */
+/* 0 = 빈 공간, 1 풀, 2 흙, 3 암반, 4 그을음 */
+const terr = new Uint8Array(W*H);
+const terrCv = document.createElement('canvas');
+terrCv.width = W; terrCv.height = H;
+const terrCtx = terrCv.getContext('2d');
+let terrImg = terrCtx.createImageData(W,H);
+let terrDirty = true;
+
+function setPix(x,y,r,g,b,a){
+  const i = (y*W+x)*4;
+  terrImg.data[i]=r; terrImg.data[i+1]=g; terrImg.data[i+2]=b; terrImg.data[i+3]=a;
+}
+const solid = (x,y)=> x>=0 && x<W && y>=0 && y<H && terr[y*W+x]!==0;
+
+/* 중점 변위법 능선 */
+function ridge(disp, lo, hi){
+  const N = 1024;
+  const h = new Float32Array(N+1);
+  h[0] = rnd(lo,hi); h[N] = rnd(lo,hi);
+  let step = N, d = disp;
+  while(step > 1){
+    const half = step>>1;
+    for(let i=half;i<N;i+=step) h[i] = (h[i-half]+h[i+half])/2 + rnd(-d,d);
+    step = half; d *= 0.52;
+  }
+  const top = new Float32Array(W);
+  for(let x=0;x<W;x++){
+    const t = x/(W-1)*N;
+    const i = Math.floor(t), f = t-i;
+    top[x] = h[i]*(1-f) + h[Math.min(N,i+1)]*f;
+  }
+  return top;
+}
+function smooth(top, n){
+  for(let k=0;k<n;k++){
+    const c = Float32Array.from(top);
+    for(let x=1;x<W-1;x++) top[x] = (c[x-1]+c[x]*2+c[x+1])/4;
+  }
+  return top;
+}
+
+/* top[x] = 지표면 y. H 이상이면 그 열은 허공(바닥 없음) */
+function genTerrain(mapId){
+  if(mapId === 'random' || !mapId)
+    mapId = MAPS[Math.floor(Math.random()*(MAPS.length-1))].id;
+  curMap = mapId;
+
+  terr.fill(0);
+  terrImg = terrCtx.createImageData(W,H);
+
+  let top;
+  if(mapId === 'plain'){
+    top = smooth(ridge(26, 244, 266), 3);
+    for(let x=0;x<W;x++) top[x] = clamp(top[x], 205, H-22);
+
+  } else if(mapId === 'peak'){
+    top = ridge(135, 140, 250);
+    for(let x=0;x<W;x++) top[x] = clamp(top[x], 74, H-22);
+
+  } else if(mapId === 'canyon'){
+    top = smooth(ridge(52, 170, 220), 2);
+    for(let x=0;x<W;x++){
+      const k = Math.max(0, 1 - Math.abs(x - W/2)/78);
+      const dip = Math.pow(k, 0.65);
+      top[x] = top[x] + dip*(H - 12 - top[x]);
+      top[x] = clamp(top[x], 96, H-4);
+    }
+
+  } else if(mapId === 'plateau'){
+    const yl = rnd(140,175), yr = rnd(150,185), valley = rnd(268, 292);
+    top = ridge(14, 0, 8);
+    for(let x=0;x<W;x++){
+      let base;
+      if(x < 214) base = yl;
+      else if(x > W-214) base = yr;
+      else base = valley;
+      top[x] = clamp(base + top[x], 90, H-18);
+    }
+
+  } else if(mapId === 'island'){
+    top = smooth(ridge(58, 190, 240), 2);
+    const gap = 78;            // 중앙 공백 반폭
+    for(let x=0;x<W;x++){
+      const d = Math.abs(x - W/2);
+      if(d < gap){ top[x] = H + 10; continue; }
+      // 섬 가장자리는 안쪽으로 갈수록 깎여 내려간다
+      const edge = clamp((d - gap)/46, 0, 1);
+      top[x] = clamp(top[x] + (1-edge)*70, 120, H-16);
+    }
+
+  } else { // hill
+    top = smooth(ridge(95, 180, 250), 2);
+    for(let x=0;x<W;x++) top[x] = clamp(top[x], 96, H-26);
+  }
+
+  for(let x=0;x<W;x++) top[x] = Math.round(top[x]);
+
+  for(let x=0;x<W;x++){
+    for(let y=top[x]; y<H; y++){
+      const d = y-top[x];
+      let m = d<5 ? 1 : d<58 ? 2 : 3;
+      terr[y*W+x] = m;
+      let r,g,b;
+      const n = ((Math.sin(x*0.37+y*0.11)*0.5+0.5)*10)|0;
+      if(m===1){ r=98+n; g=196+n; b=74+n; if(d===0){ r=140; g=232; b=110; } }
+      else if(m===2){ r=132+n; g=88+n; b=52+n; if(((y+ (x>>3))%14)===0){ r-=18; g-=12; b-=8; } }
+      else { r=74+n; g=70+n; b=84+n; if(((y+(x>>2))%9)===0){ r+=12; g+=12; b+=16; } }
+      setPix(x,y,r,g,b,255);
+    }
+  }
+  terrDirty = true;
+  return top;
+}
+
+function carve(cx,cy,r){
+  cx|=0; cy|=0;
+  const r2 = r*r, rb = (r+3)*(r+3);
+  const y0 = Math.max(0,cy-r-3), y1 = Math.min(H-1,cy+r+3);
+  const x0 = Math.max(0,cx-r-3), x1 = Math.min(W-1,cx+r+3);
+  for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++){
+    const dx=x-cx, dy=y-cy, d=dx*dx+dy*dy, i=y*W+x;
+    if(d<=r2){ if(terr[i]){ terr[i]=0; setPix(x,y,0,0,0,0); } }
+    else if(d<=rb && terr[i] && terr[i]!==4){ terr[i]=4; setPix(x,y, 46+((x*7+y*3)%10), 32, 26, 255); }
+  }
+  terrDirty = true;
+}
+
+/* ---------------- 탱크 ---------------- */
+const COL = [
+  {body:'#e05a4a', dark:'#8e2f24', light:'#ff9a86', name:'1P'},
+  {body:'#4a8ce0', dark:'#23508e', light:'#8ec4ff', name:'2P'}
+];
+const TW = 7;   // 트랙 반폭
+const TH = 9;   // 몸통 높이
+
+function makeTank(i,x){
+  return {
+    i, x, y:0, hp:100, dir: i===0?1:-1,
+    angle: i===0?45:135, power:60, dead:false, com:false,
+    weapon:0, ammo: WEAPONS.map(w=>w.ammo), moves:60, fall:0
+  };
+}
+let tanks = [];
+
+function tankSolidAt(x,y){
+  x|=0; y|=0;
+  for(let i=-TW;i<=TW;i++) if(solid(x+i,y)) return true;
+  return false;
+}
+function surfaceY(x, fromY){
+  let y = Math.max(0, (fromY|0)-CLIMB-3);
+  while(y<H && !tankSolidAt(x,y)) y++;
+  return y;
+}
+
+/* ---------------- 게임 상태 ---------------- */
+let state = 'title';       // title | menu | aim | fly | settle | over
+let turn = 0;              // 0 or 1
+let wind = 0;
+let timer = 30;
+let shots = [];            // 비행중 포탄
+let parts = [];            // 파티클
+let zones = [];            // 방사능 지대
+let inters = [];           // 요격기
+let floats = [];           // 데미지 숫자
+let trail = [];            // 지난 탄도
+let shake = 0, flash = 0;
+let msg = '', msgT = 0;
+let winner = -1;
+let holding = false, holdP = 0;
+let round = 0;
+
+/* 플레이어별 조작키. e.code 기준이라 한/영 상태나 CapsLock 영향을 받지 않는다 */
+const CTRL = [
+  {up:'KeyW', down:'KeyS', left:'KeyA', right:'KeyD',
+   fire:['Space'], label:'W A S D + SPACE'},
+  {up:'ArrowUp', down:'ArrowDown', left:'ArrowLeft', right:'ArrowRight',
+   fire:['Enter','NumpadEnter'], label:'방향키 + ENTER'},
+];
+const BLOCK = ['Space','Enter','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'];
+
+const keys = {};
+addEventListener('keydown', e=>{
+  if(BLOCK.includes(e.code)) e.preventDefault();
+  if(e.repeat) return;
+  ac();
+  onKey(e.code, true);
+  keys[e.code] = true;
+});
+addEventListener('keyup', e=>{ keys[e.code] = false; onKey(e.code, false); });
+
+/* Digit3 / Numpad3 → 3, 그 외엔 0 */
+function digitOf(code){
+  const m = /^(?:Digit|Numpad)([1-9])$/.exec(code);
+  return m ? +m[1] : 0;
+}
+
+function onKey(k, down){
+  if(state === 'title'){ if(down){ state = 'menu'; tone(660,0.07,'square',0.09); } return; }
+  if(state === 'menu'){ if(down) menuKey(k); return; }
+  if(state === 'over'){
+    if(!down) return;
+    if(k==='KeyR') startGame();
+    else if(k==='KeyM'||k==='Escape'){ state='menu'; tone(440,0.07,'square',0.09); }
+    return;
+  }
+  if(state !== 'aim') return;
+  const t = tanks[turn];
+  if(t.com) return;              // COM 턴에는 입력 무시
+  const c = CTRL[t.i];           // 지금 턴인 플레이어의 키만 받는다
+
+  const d = digitOf(k);
+  if(down && d >= 1 && d <= WEAPONS.length){
+    const n = d-1;
+    if(t.ammo[n] > 0){ t.weapon = n; tone(880,0.05,'square',0.08); say(WEAPONS[n].name+' — '+WEAPONS[n].tip); }
+    else { tone(180,0.09,'sawtooth',0.08); say('탄약 없음'); }
+  }
+  if(c.fire.includes(k)){
+    if(down){ holding = true; holdP = 0; chargeStart(); }
+    else if(holding){ holding = false; chargeStop(); fire(t, Math.max(4, holdP)); }
+  }
+}
+function say(s){ msg = s; msgT = 3; }
+
+/* 메뉴는 양쪽 키를 모두 받는다 */
+function menuKey(k){
+  if(k==='ArrowUp'||k==='KeyW'||k==='ArrowDown'||k==='KeyS'){
+    menuRow = 1-menuRow; tone(520,0.04,'square',0.07); return;
+  }
+  if(k==='ArrowLeft'||k==='KeyA'||k==='ArrowRight'||k==='KeyD'){
+    const d = (k==='ArrowRight'||k==='KeyD') ? 1 : -1;
+    if(menuRow===0) mode = (mode + d + MODES.length) % MODES.length;
+    else            mapSel = (mapSel + d + MAPS.length) % MAPS.length;
+    tone(760,0.04,'square',0.08);
+    return;
+  }
+  if(k==='Space'||k==='Enter'||k==='NumpadEnter'){ tone(880,0.1,'square',0.11,220); startGame(); }
+}
+function label(i){ return (mode===0 && i===1) ? 'COM' : COL[i].name; }
+
+/* ---------------- 조준 / 이동 ---------------- */
+function aimUpdate(dt){
+  const t = tanks[turn];
+  const c = CTRL[t.i];
+  if(keys[c.up])   t.angle = clamp(t.angle + t.dir*80*dt, 0, 180);
+  if(keys[c.down]) t.angle = clamp(t.angle - t.dir*80*dt, 0, 180);
+  if(!holding){
+    let mv = 0;
+    if(keys[c.left])  mv = -1;
+    if(keys[c.right]) mv = +1;
+    if(mv && t.moves > 0){
+      moveAcc += 60*dt;
+      while(moveAcc >= 1 && t.moves > 0){
+        moveAcc -= 1;
+        const nx = clamp(t.x + mv, TW+1, W-TW-2);
+        const ny = surfaceY(nx, t.y);
+        if(ny < t.y - CLIMB){ moveAcc = 0; say('턱이 너무 높다'); break; }  // 벽
+        t.x = nx; t.y = ny; t.moves--;
+        if((t.moves & 3) === 0) tone(70,0.03,'square',0.04);
+      }
+    } else moveAcc = 0;
+  }
+  if(holding){
+    holdP += 62*dt;
+    if(holdP >= 100){ holdP -= 100; tone(1000,0.05,'square',0.07,-500); }  // 다 차면 0부터 다시
+    chargeSet(holdP);
+  }
+  timer -= dt;
+  if(timer <= 0){
+    if(holding){ holding=false; chargeStop(); }
+    say('시간 초과!'); fire(t, Math.max(4, holdP||50));
+  }
+}
+let moveAcc = 0;
+
+function muzzle(t, len){
+  const a = t.angle*Math.PI/180;
+  return { x: t.x + Math.cos(a)*len, y: (t.y-TH) - Math.sin(a)*len, a };
+}
+
+function fire(t, power){
+  const w = WEAPONS[t.weapon];
+  t.power = power;
+  if(t.ammo[t.weapon] !== Infinity) t.ammo[t.weapon]--;
+  const m = muzzle(t, 15);
+  const v = power*0.09;
+  shots.push({
+    x:m.x, y:m.y, vx:Math.cos(m.a)*v, vy:-Math.sin(m.a)*v,
+    w, owner:t.i, dig:0, split:false, life:0
+  });
+  trail = [];
+  // 발사 화염
+  for(let i=0;i<14;i++)
+    parts.push({x:m.x, y:m.y, vx:Math.cos(m.a)*rnd(1,3.5)+rnd(-.6,.6),
+      vy:-Math.sin(m.a)*rnd(1,3.5)+rnd(-.6,.6), l:rnd(.15,.4), c:'#ffd27a', g:0.02, s:2});
+  shake = Math.max(shake, 3);
+  tone(420, 0.12, 'square', 0.16, -300);
+  boom(0.45);
+  whistleStart();
+  state = 'fly';
+  if(t.ammo[t.weapon] === 0) t.weapon = 0;
+}
+
+/* ---------------- 포탄 물리 ---------------- */
+const G = 0.14;
+function flyUpdate(){
+  for(let si=shots.length-1; si>=0; si--){
+    const p = shots[si];
+    p.vy += G;
+    p.vx += wind*0.0013;
+    p.life++;
+
+    // 다연장: 정점에서 분열
+    if(p.w.id === 'mirv' && !p.split && p.vy >= 0 && p.life > 12){
+      p.split = true;
+      shots.splice(si,1);
+      for(let k=-1;k<=1;k++)
+        shots.push({x:p.x, y:p.y, vx:p.vx + k*0.85, vy:p.vy - 0.4 + Math.abs(k)*0.25,
+          w:p.w, owner:p.owner, dig:0, split:true, life:0});
+      for(let i=0;i<12;i++) parts.push({x:p.x,y:p.y,vx:rnd(-2,2),vy:rnd(-2,1),l:rnd(.2,.5),c:'#ff7ad0',g:0.03,s:2});
+      tone(1200,0.1,'square',0.1,-600);
+      continue;
+    }
+
+    const steps = Math.max(1, Math.ceil(Math.hypot(p.vx,p.vy)/1.5));
+    let done = false;
+    for(let s=0;s<steps && !done;s++){
+      p.x += p.vx/steps; p.y += p.vy/steps;
+
+      // 요격기 판정
+      for(let k=0;k<inters.length;k++){
+        const it = inters[k];
+        if(it.owner === p.owner) continue;
+        if(Math.hypot(p.x-it.x, p.y-it.y) < it.r){
+          inters.splice(k,1);
+          for(let i=0;i<8;i++) parts.push({x:it.x,y:it.y,vx:rnd(-1,1),vy:rnd(-2,0),l:.4,c:'#6cf0c8',g:.02,s:2});
+          tone(1600,0.08,'square',0.14,-1200);
+          explode(p, p.x, p.y, 0.55);
+          shots.splice(si,1); done = true; break;
+        }
+      }
+      if(done) break;
+
+      if(p.x < -60 || p.x > W+60){ shots.splice(si,1); done = true; break; }
+      if(p.y > H+40){ shots.splice(si,1); done = true; say('빗나감'); break; }
+
+      // 탱크 직격
+      for(const t of tanks){
+        if(t.dead) continue;
+        if(Math.abs(p.x-t.x) < TW+2 && p.y > t.y-TH-2 && p.y < t.y+2){
+          explode(p, p.x, p.y, 1); shots.splice(si,1); done = true; break;
+        }
+      }
+      if(done) break;
+
+      // 지형
+      if(p.y >= 0 && solid(p.x|0, p.y|0)){
+        if(p.w.id === 'dig'){
+          if(p.dig === 0){ p.dig = 1; tone(260,0.2,'sawtooth',0.12,-160); }
+          p.dig++;
+          carve(p.x, p.y, 8);
+          for(let i=0;i<2;i++) parts.push({x:p.x,y:p.y,vx:rnd(-1,1),vy:rnd(-1.5,0),l:.35,c:'#a9743f',g:.05,s:2});
+          if(p.dig > 80 || p.y > H-4){
+            explode(p, p.x, p.y, 1); shots.splice(si,1); done = true;
+          }
+        } else {
+          explode(p, p.x, p.y, 1); shots.splice(si,1); done = true;
+        }
+      }
+    }
+    if(!done){
+      if(p.life % 2 === 0)
+        parts.push({x:p.x, y:p.y, vx:rnd(-.2,.2), vy:rnd(-.2,.1), l:rnd(.3,.7), c:'#8a8fa8', g:-0.01, s:1, smoke:1});
+      if(p.life % 2 === 0) trail.push({x:p.x, y:p.y});
+    }
+  }
+  if(shots.length){
+    let best = shots[0];
+    for(const p of shots) if(p.vy < best.vy) best = p;
+    whistleSet(best.vy);
+  } else {
+    whistleStop();
+    state = 'settle';
+  }
+}
+
+/* ---------------- COM (1인용) ---------------- */
+let ai = null, comFired = 0;
+
+/* 탄도를 미리 굴려보고 목표까지의 최소 접근 거리를 반환 */
+function simShot(t, angle, power, e){
+  const a = angle*Math.PI/180;
+  let x = t.x + Math.cos(a)*15, y = (t.y-TH) - Math.sin(a)*15;
+  let vx = Math.cos(a)*power*0.09, vy = -Math.sin(a)*power*0.09;
+  let best = 1e9;
+  const ex = e.x, ey = e.y-5;
+  for(let i=0;i<700;i++){
+    vy += G; vx += wind*0.0013;
+    const steps = Math.max(1, Math.ceil(Math.hypot(vx,vy)/1.5));
+    for(let s=0;s<steps;s++){
+      x += vx/steps; y += vy/steps;
+      const d = Math.hypot(x-ex, y-ey);
+      if(d < best) best = d;
+      if(x < -60 || x > W+60 || y > H+40) return best;
+      if(Math.abs(x-e.x) < TW+2 && y > e.y-TH-2 && y < e.y+2) return 0;
+      if(y >= 0 && solid(x|0, y|0)) return best;
+    }
+  }
+  return best;
+}
+
+function aiSearch(t, e){
+  let best = {d:1e9, elev:45, power:60};
+  for(let elev=12; elev<=86; elev+=4)
+    for(let pw=22; pw<=100; pw+=4){
+      const d = simShot(t, t.dir>0?elev:180-elev, pw, e);
+      if(d < best.d) best = {d, elev, power:pw};
+    }
+  const b = best;
+  for(let elev=b.elev-4; elev<=b.elev+4; elev++)
+    for(let pw=b.power-4; pw<=b.power+4; pw++){
+      if(pw < 10 || pw > 100 || elev < 6 || elev > 89) continue;
+      const d = simShot(t, t.dir>0?elev:180-elev, pw, e);
+      if(d < best.d) best = {d, elev, power:pw};
+    }
+  return best;
+}
+
+function aiPlan(){
+  const t = tanks[turn], e = tanks[1-turn];
+  // 가끔 자기 앞에 요격기를 깔아둔다
+  const hasOwn = inters.some(it => it.owner === t.i);
+  if(t.ammo[3] > 0 && !hasOwn && Math.random() < 0.2){
+    t.weapon = 3;
+    ai = {phase:'think', wait:0.8, tAngle: t.dir>0?76:104, tPower:20};
+    return;
+  }
+  const b = aiSearch(t, e);
+  // 초탄은 가늠 사격, 쏠수록 정밀해진다
+  const ae = comFired===0 ? 4.5 : comFired===1 ? 3.0 : 1.8;
+  const ap = comFired===0 ? 9.0 : comFired===1 ? 6.0 : 3.5;
+  let elev = b.elev + rnd(-ae,ae);
+  let pw   = clamp(b.power + rnd(-ap,ap), 8, 100);
+  comFired++;
+
+  // 조준이 잘 잡혔으면 특수탄을 아낌없이 쓴다
+  let wp = 0;
+  if(b.d < 16 && t.ammo[1] > 0 && Math.random() < 0.45) wp = 1;         // 광역탄
+  else if(b.d < 26 && t.ammo[4] > 0 && Math.random() < 0.3) wp = 4;      // 방사능탄
+  else if(b.d < 22 && t.ammo[5] > 0 && Math.random() < 0.3) wp = 5;      // 다연장
+  else if(b.d > 40 && t.ammo[2] > 0 && Math.random() < 0.25) wp = 2;     // 땅굴탄
+  t.weapon = wp;
+
+  ai = {phase:'think', wait:0.8, tAngle: t.dir>0?elev:180-elev, tPower:pw};
+}
+
+function aiUpdate(dt){
+  const t = tanks[turn];
+  if(!ai) aiPlan();
+  timer -= dt;
+
+  if(ai.phase === 'think'){
+    ai.wait -= dt;
+    if(ai.wait <= 0) ai.phase = 'turn';
+    return;
+  }
+  if(ai.phase === 'turn'){
+    const d = ai.tAngle - t.angle;
+    const step = 105*dt;
+    if(Math.abs(d) <= step){
+      t.angle = ai.tAngle;
+      ai.phase = 'charge';
+      holding = true; holdP = 0; chargeStart();
+    } else t.angle += Math.sign(d)*step;
+    return;
+  }
+  if(ai.phase === 'charge'){
+    holdP += 62*dt;
+    chargeSet(holdP);
+    if(holdP >= ai.tPower){
+      holding = false; chargeStop();
+      fire(t, clamp(ai.tPower, 4, 100));
+      ai = null;
+    }
+  }
+}
+
+/* ---------------- 폭발 ---------------- */
+function explode(p, x, y, scale){
+  const w = p.w;
+  const r = w.r*scale;
+  carve(x, y, r);
+  boom(clamp(r/26,0.6,1.8));
+  shake = Math.max(shake, 4 + r*0.28);
+  flash = Math.min(1, 0.25 + r/150);
+
+  const n = 20 + (r|0);
+  for(let i=0;i<n;i++){
+    const a = rnd(0,Math.PI*2), sp = rnd(0.6, 2.2+r*0.09);
+    parts.push({x, y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp-0.6, l:rnd(.25,.75),
+      c: i%3===0 ? '#fff2b0' : i%3===1 ? w.color : '#ff8a3c', g:0.09, s: i%4===0?3:2});
+  }
+  for(let i=0;i<12;i++)
+    parts.push({x, y, vx:rnd(-1.2,1.2), vy:rnd(-1.6,-.2), l:rnd(.6,1.3), c:'#6a6f85', g:-0.012, s:3, smoke:1});
+  parts.push({ring:1, x, y, r:2, max:r*1.9, l:0.34, c:w.color});
+
+  // 데미지: 가까울수록 강하게
+  const dr = r*1.75;
+  for(const t of tanks){
+    if(t.dead) continue;
+    const d = Math.hypot(x - t.x, y - (t.y-5));
+    if(d < dr){
+      let dmg = w.dmg * Math.pow(1 - d/dr, 1.35);
+      if(d < 8) dmg = w.dmg;                       // 완전 직격
+      dmg = Math.round(dmg);
+      if(dmg > 0) hurt(t, dmg, d < 10 ? '직격!' : '');
+    }
+  }
+
+  if(w.id === 'rad'){
+    zones.push({x, y, r:74, turns:4, t:0});
+    tone(240,0.6,'sawtooth',0.09,-90);
+    say('☢ 오염 지대 발생 — 4턴간 유지');
+  }
+  if(w.id === 'inter'){
+    inters.push({x, y:y-6, r:70, owner:p.owner, t:0});
+    tone(1400,0.25,'triangle',0.12,400);
+    say((p.owner===0?'1P':'2P')+' 요격기 배치 — 적 포탄 1발 격추');
+  }
+}
+
+function hurt(t, dmg, tag){
+  t.hp -= dmg;
+  floats.push({x:t.x, y:t.y-TH-8, v:-0.45, l:1.4, s:(tag?tag+' ':'')+'-'+dmg, c: tag?'#ffd24a':'#ff6a6a'});
+  if(t.hp <= 0){ t.hp = 0; kill(t); }
+}
+function kill(t){
+  if(t.dead) return;
+  t.dead = true;
+  boom(1.7); shake = Math.max(shake, 16); flash = 1;
+  for(let i=0;i<80;i++){
+    const a = rnd(0,Math.PI*2), sp = rnd(0.5,5);
+    parts.push({x:t.x, y:t.y-5, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp-1.2, l:rnd(.4,1.3),
+      c: i%3?'#ffcf5a':'#ff5a3c', g:0.1, s: i%5===0?3:2});
+  }
+  parts.push({ring:1,x:t.x,y:t.y-5,r:3,max:90,l:0.6,c:'#fff'});
+}
+
+/* ---------------- 정착(낙하) ---------------- */
+function settleUpdate(){
+  let moving = false;
+  for(const t of tanks){
+    if(t.dead) continue;
+    if(t.y >= H){ say('추락!'); kill(t); continue; }
+    if(!tankSolidAt(t.x, t.y)){
+      moving = true;
+      t.y += 3; t.fall += 3;
+      if(t.y >= H){ t.y = H; }
+      if((t.fall|0) % 9 === 0)
+        parts.push({x:t.x+rnd(-6,6), y:t.y-2, vx:rnd(-.4,.4), vy:rnd(-.6,0), l:.4, c:'#9aa0b8', g:0, s:2, smoke:1});
+    } else if(t.fall > 0){
+      const f = t.fall;
+      t.fall = 0;
+      if(f > 14){
+        const dmg = Math.round((f-14)*0.55);
+        if(dmg > 0){ hurt(t, dmg, '낙하'); boom(0.5); shake = Math.max(shake, 5); }
+        for(let i=0;i<10;i++) parts.push({x:t.x+rnd(-7,7), y:t.y, vx:rnd(-1.2,1.2), vy:rnd(-1.2,-.1), l:.4, c:'#b9a184', g:.08, s:2});
+      }
+    }
+  }
+  if(!moving && parts.length < 90){
+    if(tanks[0].dead || tanks[1].dead) return gameOver();
+    nextTurn();
+  }
+}
+
+function gameOver(){
+  const a0 = !tanks[0].dead, a1 = !tanks[1].dead;
+  winner = a0 && !a1 ? 0 : a1 && !a0 ? 1 : -1;
+  state = 'over';
+  whistleStop();
+  tone(winner===0?520:392, 0.5, 'square', 0.14, 200);
+}
+
+function nextTurn(){
+  turn = 1-turn; round++;
+  // 방사능 지대 정산
+  for(let i=zones.length-1;i>=0;i--){
+    const z = zones[i];
+    for(const t of tanks){
+      if(t.dead) continue;
+      if(Math.hypot(t.x-z.x, (t.y-5)-z.y) < z.r){
+        hurt(t, 9, '☢');
+      }
+    }
+    z.turns--;
+    if(z.turns <= 0) zones.splice(i,1);
+  }
+  if(tanks[0].dead || tanks[1].dead) return gameOver();
+  wind = Math.round(rnd(-12,12));
+  timer = 30;
+  holding = false; holdP = 0; ai = null;
+  const t = tanks[turn];
+  t.moves = 60;
+  t.y = surfaceY(t.x, t.y);
+  state = 'aim';
+  tone(660,0.08,'square',0.09);
+  if(t.com) aiPlan();
+}
+
+/* ---------------- 시작 ---------------- */
+let stars = [];
+/* 지면이 있는 자리를 골라 배치 */
+function spawnX(lo, hi){
+  for(let k=0;k<40;k++){
+    const x = Math.round(rnd(lo,hi));
+    if(surfaceY(x, 30) < H-4) return x;
+  }
+  return Math.round((lo+hi)/2);
+}
+function startGame(){
+  genTerrain(MAPS[mapSel].id);
+  tanks = [makeTank(0, spawnX(46,132)), makeTank(1, spawnX(W-132,W-46))];
+  tanks[1].com = (mode === 0);
+  for(const t of tanks) t.y = surfaceY(t.x, 30);
+  shots.length = 0; parts.length = 0; zones.length = 0; inters.length = 0;
+  floats.length = 0; trail.length = 0;
+  turn = Math.random()<0.5?0:1; round = 0;
+  wind = Math.round(rnd(-12,12));
+  timer = 30; winner = -1; shake = 0; flash = 0;
+  holding = false; holdP = 0; ai = null; comFired = 0;
+  state = 'aim';
+  say(MAPS.find(m=>m.id===curMap).name + ' — 교전 개시');
+  if(tanks[turn].com) aiPlan();
+}
+stars = Array.from({length:70},()=>({x:rnd(0,W), y:rnd(0,150), b:rnd(0.2,1), p:rnd(0,6.3)}));
+
+/* ---------------- 그리기 ---------------- */
+function drawSky(t){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#0b1030'); g.addColorStop(0.55,'#2a2350'); g.addColorStop(1,'#6a3f5a');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  for(const s of stars){
+    const a = 0.35 + Math.sin(t*1.6+s.p)*0.3;
+    ctx.fillStyle = 'rgba(255,255,255,'+(a*s.b).toFixed(2)+')';
+    ctx.fillRect(s.x|0, s.y|0, 1, 1);
+  }
+  // 달
+  ctx.fillStyle = '#f4eeda'; ctx.beginPath(); ctx.arc(548, 56, 17, 0, 6.3); ctx.fill();
+  ctx.fillStyle = '#e6dcc0';
+  ctx.fillRect(542,50,4,4); ctx.fillRect(552,62,5,3); ctx.fillRect(546,64,3,3);
+  // 원경 산맥
+  ctx.fillStyle = '#241d3c';
+  ctx.beginPath(); ctx.moveTo(0,H);
+  for(let x=0;x<=W;x+=16) ctx.lineTo(x, 210 + Math.sin(x*0.017)*26 + Math.sin(x*0.041)*13);
+  ctx.lineTo(W,H); ctx.fill();
+  ctx.fillStyle = '#1a1530';
+  ctx.beginPath(); ctx.moveTo(0,H);
+  for(let x=0;x<=W;x+=12) ctx.lineTo(x, 238 + Math.sin(x*0.026+2)*20 + Math.sin(x*0.06)*8);
+  ctx.lineTo(W,H); ctx.fill();
+}
+
+function drawTank(t){
+  if(t.dead) return;
+  const c = COL[t.i], x = Math.round(t.x), y = Math.round(t.y);
+  // 포신
+  const a = t.angle*Math.PI/180;
+  const px = x, py = y-TH+1;
+  ctx.strokeStyle = c.dark; ctx.lineWidth = 4; ctx.lineCap = 'butt';
+  ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(px+Math.cos(a)*14, py-Math.sin(a)*14); ctx.stroke();
+  ctx.strokeStyle = c.light; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(px+Math.cos(a)*13, py-Math.sin(a)*13); ctx.stroke();
+  // 몸통
+  ctx.fillStyle = c.dark;  ctx.fillRect(x-TW, y-6, TW*2+1, 6);
+  ctx.fillStyle = c.body;  ctx.fillRect(x-TW, y-7, TW*2+1, 5);
+  ctx.fillStyle = c.light; ctx.fillRect(x-TW+1, y-7, TW*2-1, 1);
+  // 포탑
+  ctx.fillStyle = c.body;  ctx.fillRect(x-4, y-11, 9, 5);
+  ctx.fillStyle = c.light; ctx.fillRect(x-3, y-11, 7, 1);
+  // 궤도
+  ctx.fillStyle = '#2b2f42'; ctx.fillRect(x-TW-1, y-3, TW*2+3, 3);
+  ctx.fillStyle = '#454a63';
+  for(let i=-TW;i<=TW;i+=3) ctx.fillRect(x+i, y-2, 2, 1);
+  // 턴 표시
+  if(state==='aim' && turn===t.i){
+    const bob = Math.sin(performance.now()/180)*2;
+    ctx.fillStyle = c.light;
+    const ay = y-24+bob;
+    ctx.fillRect(x-3, ay, 7, 2); ctx.fillRect(x-2, ay+2, 5, 2);
+    ctx.fillRect(x-1, ay+4, 3, 2); ctx.fillRect(x, ay+6, 1, 2);
+  }
+}
+
+function bar(x,y,w,h,v,col,bg){
+  ctx.fillStyle = bg||'#131730'; ctx.fillRect(x,y,w,h);
+  ctx.fillStyle = col; ctx.fillRect(x+1,y+1,Math.max(0,Math.round((w-2)*v)),h-2);
+  ctx.strokeStyle = '#3b4470'; ctx.lineWidth = 1;
+  ctx.strokeRect(x+0.5,y+0.5,w-1,h-1);
+}
+function txt(s,x,y,col,size,align){
+  ctx.font = 'bold '+(size||10)+'px "Malgun Gothic",monospace';
+  ctx.textAlign = align||'left'; ctx.textBaseline = 'top';
+  ctx.fillStyle = '#000'; ctx.fillText(s,x+1,y+1);
+  ctx.fillStyle = col; ctx.fillText(s,x,y);
+}
+
+function drawHUD(){
+  // 상단 패널
+  ctx.fillStyle = 'rgba(8,10,26,0.82)'; ctx.fillRect(0,0,W,30);
+  ctx.fillStyle = '#3b4470'; ctx.fillRect(0,30,W,1);
+
+  for(let i=0;i<2;i++){
+    const t = tanks[i], x = i===0?6:W-146;
+    txt(label(i), x, 4, COL[i].light, 10);
+    txt(t.dead?'격파':(t.hp+''), x+140, 4, t.hp>50?'#9dffa0':t.hp>25?'#ffd24a':'#ff6a6a', 10, 'right');
+    bar(x, 16, 140, 9, t.hp/100, t.hp>50?'#4ad46a':t.hp>25?'#e0b23a':'#e04a4a');
+    if(turn===i && state==='aim'){
+      ctx.strokeStyle = COL[i].light; ctx.lineWidth=1;
+      ctx.strokeRect(x-2.5, 1.5, 145, 26);
+    }
+  }
+  // 바람
+  txt('바람', W/2, 3, '#8f9ad0', 9, 'center');
+  const wx = W/2, wy = 18, aw = Math.abs(wind);
+  ctx.fillStyle = wind===0 ? '#8f9ad0' : (wind>0 ? '#7ad0ff' : '#ff9ad0');
+  if(wind !== 0){
+    const dir = Math.sign(wind);
+    for(let i=0;i<Math.min(6,Math.ceil(aw/2));i++){
+      const px = wx + dir*(6+i*5);
+      ctx.fillRect(px-2, wy-1, 4, 2);
+    }
+    ctx.fillRect(wx+dir*(6+Math.min(6,Math.ceil(aw/2))*5)-1, wy-3, 2, 6);
+  }
+  txt((wind>0?'▶ ':wind<0?'◀ ':'')+aw, wx, wy+4, '#cfd6ff', 9, 'center');
+
+  if(state !== 'aim' && state !== 'fly') return;
+
+  // 하단 조준 패널
+  const t = tanks[turn];
+  const py = H-46;
+  ctx.fillStyle = 'rgba(8,10,26,0.82)'; ctx.fillRect(0,py,W,46);
+  ctx.fillStyle = '#3b4470'; ctx.fillRect(0,py,W,1);
+
+  const elev = Math.round(t.dir>0 ? t.angle : 180-t.angle);
+  txt('각도', 8, py+5, '#8f9ad0', 9);
+  txt(elev+'°', 44, py+4, '#ffe08a', 11);
+  txt('이동', 8, py+19, '#8f9ad0', 9);
+  bar(34, py+20, 52, 7, t.moves/60, '#6cf0c8');
+  txt('시간', 8, py+32, '#8f9ad0', 9);
+  bar(34, py+33, 52, 7, clamp(timer/30,0,1), timer<8?'#e04a4a':'#e0b23a');
+
+  // 파워 게이지
+  txt('파워', 100, py+5, '#8f9ad0', 9);
+  const pw = holding||state==='fly' ? (state==='fly'? t.power : holdP) : holdP;
+  bar(100, py+17, 150, 12, pw/100, holding?'#ff6a4a':'#ffb04a');
+  for(let i=1;i<10;i++){ ctx.fillStyle='#000'; ctx.fillRect(100+i*15, py+18, 1, 10); }
+  txt(Math.round(pw)+'', 254, py+18, '#ffe08a', 11);
+  const fk = CTRL[t.i].fire[0]==='Space' ? 'SPACE' : 'ENTER';
+  const hint = t.com
+    ? (ai ? (ai.phase==='think'?'COM 계산중...':ai.phase==='turn'?'COM 조준중...':'COM 충전중...') : 'COM 발사')
+    : (holding ? '놓으면 발사 (100 넘으면 0부터 다시)' : fk+' 길게 눌러 충전');
+  txt(hint, 130, py+5, t.com?'#a8b0d8':(holding?'#ff9a6a':'#5f6a9a'), 9);
+  if(!t.com) txt(label(t.i)+' 조작  '+CTRL[t.i].label, 100, py+32, COL[t.i].light, 9);
+
+  // 무기 슬롯
+  for(let i=0;i<WEAPONS.length;i++){
+    const w = WEAPONS[i], bx = 292 + i*57, sel = t.weapon===i;
+    const out = t.ammo[i] === 0;
+    ctx.fillStyle = sel ? 'rgba(255,255,255,0.13)' : 'rgba(255,255,255,0.04)';
+    ctx.fillRect(bx, py+6, 53, 32);
+    ctx.strokeStyle = sel ? w.color : '#2c3358'; ctx.lineWidth=1;
+    ctx.strokeRect(bx+0.5, py+6.5, 52, 31);
+    txt((i+1)+'', bx+4, py+8, sel?w.color:'#5f6a9a', 9);
+    txt(w.name, bx+26, py+8, out?'#4a4f6a':(sel?'#fff':'#a8b0d8'), 9, 'center');
+    const am = t.ammo[i];
+    txt(am===Infinity?'∞':am+'발', bx+26, py+22, out?'#4a4f6a':(am===Infinity?'#8f9ad0':'#ffd24a'), 10, 'center');
+  }
+}
+
+function drawAimGuide(){
+  if(state !== 'aim') return;
+  const t = tanks[turn];
+  const a = t.angle*Math.PI/180;
+  const sx = t.x + Math.cos(a)*16, sy = (t.y-TH) - Math.sin(a)*16;
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  for(let i=0;i<7;i++){
+    const d = 18 + i*7;
+    ctx.fillRect(Math.round(t.x + Math.cos(a)*d), Math.round((t.y-TH) - Math.sin(a)*d), 2, 2);
+  }
+}
+
+function drawWorld(t){
+  // 지난 탄도
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
+  for(let i=0;i<trail.length;i+=2) ctx.fillRect(trail[i].x|0, trail[i].y|0, 1, 1);
+
+  // 방사능 지대
+  for(const z of zones){
+    const pul = 0.5 + Math.sin(t*3 + z.t)*0.5;
+    ctx.fillStyle = 'rgba(140,255,80,'+(0.07+pul*0.06).toFixed(3)+')';
+    ctx.beginPath(); ctx.arc(z.x, z.y, z.r, 0, 6.3); ctx.fill();
+    ctx.strokeStyle = 'rgba(160,255,90,'+(0.35+pul*0.35).toFixed(2)+')'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.arc(z.x, z.y, z.r, 0, 6.3); ctx.stroke();
+    txt('☢ '+z.turns, z.x, z.y-z.r-11, '#a8ff5c', 9, 'center');
+  }
+  // 요격기
+  for(const it of inters){
+    const pul = 0.5+Math.sin(t*5)*0.5;
+    ctx.strokeStyle = 'rgba(108,240,200,'+(0.25+pul*0.4).toFixed(2)+')'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.arc(it.x, it.y, it.r, 0, 6.3); ctx.stroke();
+    ctx.fillStyle = '#6cf0c8';
+    ctx.fillRect(it.x-3, it.y-1, 7, 3); ctx.fillRect(it.x-1, it.y-5, 3, 4);
+    ctx.fillStyle = pul>0.5?'#fff':'#2a6a5a'; ctx.fillRect(it.x-1, it.y-7, 2, 2);
+  }
+}
+
+function drawParticles(){
+  for(const p of parts){
+    if(p.ring){
+      ctx.strokeStyle = p.c; ctx.globalAlpha = clamp(p.l*2.4,0,1); ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.3); ctx.stroke();
+      ctx.globalAlpha = 1; continue;
+    }
+    ctx.globalAlpha = p.smoke ? clamp(p.l*0.55,0,0.5) : clamp(p.l*2.2,0,1);
+    ctx.fillStyle = p.c;
+    ctx.fillRect(p.x|0, p.y|0, p.s, p.s);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawShots(){
+  for(const p of shots){
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(Math.round(p.x)-1, Math.round(p.y)-1, 3, 3);
+    ctx.fillStyle = p.w.color;
+    ctx.fillRect(Math.round(p.x)-2, Math.round(p.y)-2, 5, 5);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(Math.round(p.x)-1, Math.round(p.y)-1, 2, 2);
+  }
+}
+
+function drawTitle(){
+  ctx.fillStyle = 'rgba(4,6,18,0.72)'; ctx.fillRect(0,0,W,H);
+  txt('F O R T R E S S', W/2, 58, '#ffd24a', 26, 'center');
+  txt('2인 대전 · 포탄 전쟁', W/2, 92, '#8f9ad0', 11, 'center');
+  txt('1P', 196, 124, COL[0].light, 12, 'center');
+  txt('2P / COM', 452, 124, COL[1].light, 12, 'center');
+  const P = [
+    ['A  D', '← →', '전차 이동'],
+    ['W  S', '↑ ↓', '포신 각도'],
+    ['SPACE', 'ENTER', '길게 눌러 충전 → 놓으면 발사'],
+    ['1 ~ 6', '1 ~ 6', '포탄 선택'],
+  ];
+  P.forEach((r,i)=>{
+    const y = 144+i*15;
+    txt(r[0], 196, y, '#cfd6ff', 10, 'center');
+    txt(r[1], 452, y, '#cfd6ff', 10, 'center');
+    txt(r[2], W/2, y, '#7f88b8', 9, 'center');
+  });
+  const L = [
+    '· 게이지가 100을 넘으면 0부터 다시 찬다',
+    '· 폭심에 가까울수록 데미지가 크다',
+    '· 발밑이 사라지면 추락 피해, 화면 밖이면 즉사',
+    '· 바람이 포탄을 밀어낸다',
+  ];
+  L.forEach((s,i)=> txt(s, W/2, 212+i*13, '#7f88b8', 9, 'center'));
+  const b = Math.sin(performance.now()/260)*0.5+0.5;
+  txt('아무 키나 눌러 시작', W/2, 278, 'rgba(255,210,74,'+(0.4+b*0.6).toFixed(2)+')', 13, 'center');
+  txt('한글 입력 상태여도 그대로 동작합니다', W/2, 306, '#4a5178', 9, 'center');
+}
+
+function drawMenu(){
+  ctx.fillStyle = 'rgba(4,6,18,0.78)'; ctx.fillRect(0,0,W,H);
+  txt('전 투 준 비', W/2, 34, '#ffd24a', 20, 'center');
+
+  const rows = [
+    {lab:'인 원', val:MODES[mode].name, sub:MODES[mode].sub},
+    {lab:'지 형', val:MAPS[mapSel].name, sub:MAPS[mapSel].tip},
+  ];
+  rows.forEach((r,i)=>{
+    const y = 86 + i*56, on = menuRow===i;
+    ctx.fillStyle = on ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)';
+    ctx.fillRect(120, y, 400, 44);
+    ctx.strokeStyle = on ? '#ffd24a' : '#2c3358'; ctx.lineWidth = 1;
+    ctx.strokeRect(120.5, y+0.5, 399, 43);
+    txt(r.lab, 136, y+8, on?'#ffd24a':'#5f6a9a', 10);
+    const b = on ? (Math.sin(performance.now()/200)*0.5+0.5) : 0;
+    txt('◀', 236, y+13, on?'rgba(255,210,74,'+(0.45+b*0.55).toFixed(2)+')':'#3a4166', 12, 'center');
+    txt('▶', 404, y+13, on?'rgba(255,210,74,'+(0.45+b*0.55).toFixed(2)+')':'#3a4166', 12, 'center');
+    txt(r.val, 320, y+9, on?'#fff':'#a8b0d8', 15, 'center');
+    txt(r.sub, 320, y+29, '#7f88b8', 9, 'center');
+  });
+
+  txt('W S / ↑ ↓  항목 이동      A D / ← →  선택      SPACE · ENTER  시작', W/2, 232, '#cfd6ff', 10, 'center');
+  txt(mode===0 ? 'COM 은 바람까지 계산해서 쏜다. 방심하면 진다.'
+               : '둘이 한 키보드에서 동시에 앉아 한다.', W/2, 258, '#7f88b8', 10, 'center');
+  txt('1P   W A S D  +  SPACE', W/2, 286, COL[0].light, 10, 'center');
+  txt(mode===0 ? 'COM   자동 조작' : '2P   ← → ↑ ↓  +  ENTER', W/2, 302, COL[1].light, 10, 'center');
+  txt('포탄 선택 1~6 은 자기 턴일 때만 먹는다', W/2, 320, '#4a5178', 9, 'center');
+}
+
+function drawOver(){
+  ctx.fillStyle = 'rgba(4,6,18,0.72)'; ctx.fillRect(0,0,W,H);
+  if(winner < 0) txt('무 승 부', W/2, 130, '#cfd6ff', 28, 'center');
+  else {
+    txt(label(winner) + '  승 리 !', W/2, 126, COL[winner].light, 28, 'center');
+    txt('남은 체력  '+tanks[winner].hp, W/2, 166, '#ffd24a', 12, 'center');
+  }
+  const b = Math.sin(performance.now()/260)*0.5+0.5;
+  txt('R  같은 설정으로 다시', W/2, 208, 'rgba(255,210,74,'+(0.4+b*0.6).toFixed(2)+')', 13, 'center');
+  txt('M  인원 · 지형 다시 고르기', W/2, 232, '#8f9ad0', 11, 'center');
+}
+
+/* ---------------- 루프 ---------------- */
+let last = performance.now();
+function loop(now){
+  let dt = (now-last)/1000; last = now;
+  dt = Math.min(dt, 0.05);
+  const T = now/1000;
+
+  // --- 갱신 ---
+  if(state === 'aim') (tanks[turn].com ? aiUpdate : aimUpdate)(dt);
+  else if(state === 'fly') flyUpdate();
+  else if(state === 'settle') settleUpdate();
+
+  for(let i=parts.length-1;i>=0;i--){
+    const p = parts[i];
+    p.l -= dt;
+    if(p.l <= 0){ parts.splice(i,1); continue; }
+    if(p.ring){ p.r += (p.max-p.r)*0.34; continue; }
+    p.x += p.vx; p.y += p.vy; p.vy += p.g||0;
+    p.vx *= 0.985;
+    if(!p.smoke && p.y>0 && solid(p.x|0,p.y|0)){ p.vy *= -0.28; p.vx *= 0.5; p.y -= 1; p.l -= dt*2; }
+  }
+  for(let i=floats.length-1;i>=0;i--){
+    const f = floats[i]; f.l -= dt; f.y += f.v; f.v *= 0.97;
+    if(f.l<=0) floats.splice(i,1);
+  }
+  for(const z of zones) z.t += dt;
+  if(msgT>0) msgT -= dt;
+  shake *= 0.86; if(shake<0.15) shake=0;
+  flash *= 0.82; if(flash<0.02) flash=0;
+
+  // --- 그리기 ---
+  ctx.save();
+  if(shake>0) ctx.translate(Math.round(rnd(-shake,shake)), Math.round(rnd(-shake,shake)));
+
+  drawSky(T);
+  if(terrDirty){ terrCtx.putImageData(terrImg,0,0); terrDirty=false; }
+  ctx.drawImage(terrCv, 0, 0);
+
+  if(state!=='title' && state!=='menu'){
+    drawWorld(T);
+    for(const t of tanks) drawTank(t);
+    drawAimGuide();
+    drawParticles();
+    drawShots();
+    for(const f of floats){
+      ctx.globalAlpha = clamp(f.l,0,1);
+      txt(f.s, f.x, f.y, f.c, 10, 'center');
+      ctx.globalAlpha = 1;
+    }
+  }
+  ctx.restore();
+
+  if(flash>0){ ctx.fillStyle = 'rgba(255,240,200,'+(flash*0.5).toFixed(3)+')'; ctx.fillRect(0,0,W,H); }
+
+  if(state==='title') drawTitle();
+  else if(state==='menu') drawMenu();
+  else {
+    drawHUD();
+    if(msgT>0){
+      ctx.globalAlpha = clamp(msgT,0,1);
+      ctx.fillStyle='rgba(8,10,26,0.8)';
+      ctx.font='bold 10px "Malgun Gothic",monospace';
+      const tw = ctx.measureText(msg).width+16;
+      ctx.fillRect(W/2-tw/2, 38, tw, 16);
+      txt(msg, W/2, 41, '#ffe08a', 10, 'center');
+      ctx.globalAlpha = 1;
+    }
+    if(state==='over') drawOver();
+  }
+
+  // 스캔라인 (옛날 감성)
+  ctx.globalAlpha = 0.05; ctx.fillStyle = '#000';
+  for(let y=0;y<H;y+=2) ctx.fillRect(0,y,W,1);
+  ctx.globalAlpha = 1;
+
+  requestAnimationFrame(loop);
+}
+genTerrain();
+tanks = [makeTank(0,90), makeTank(1,W-90)];
+for(const t of tanks) t.y = surfaceY(t.x, 40);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
